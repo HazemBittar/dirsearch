@@ -17,26 +17,31 @@
 #  Author: Mauro Soria
 
 from lib.core.decorators import locked
-from lib.core.settings import IS_WINDOWS
+from lib.core.settings import (
+    COMMAND,
+    NEW_LINE,
+    START_TIME,
+)
+from lib.report.factory import BaseReport, FileReportMixin
+from lib.utils.common import get_readable_size
 
 
-class FileBaseReport:
-    def __init__(self, output_file):
-        if IS_WINDOWS:
-            from os.path import normpath
+class PlainTextReport(FileReportMixin, BaseReport):
+    __format__ = "plain"
+    __extension__ = "txt"
 
-            output_file = normpath(output_file)
-
-        self.output_file = output_file
+    def new(self):
+        return f"# Dirsearch started {START_TIME} as: {COMMAND}" + NEW_LINE * 2
 
     @locked
-    def save(self, entries):
-        if not entries:
-            return
+    def save(self, file, result):
+        readable_size = get_readable_size(result.length)
+        data = self.parse(file)
+        data += f"{result.status} {readable_size.rjust(6, chr(32))} {result.url}"
 
-        with open(self.output_file, "w") as fd:
-            fd.writelines(self.generate(entries))
-            fd.flush()
+        if result.redirect:
+            data += f"  ->  {result.redirect}"
 
-    def generate(self, entries):
-        raise NotImplementedError
+        data += NEW_LINE
+
+        self.write(file, data)

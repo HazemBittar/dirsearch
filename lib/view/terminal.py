@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #  This program is free software; you can redistribute it and/or modify
-#  it under the terms of the GNU General Publlic License as published by
+#  it under the terms of the GNU General Public License as published by
 #  the Free Software Foundation; either version 2 of the License, or
 #  (at your option) any later version.
 #
@@ -17,13 +17,12 @@
 #  Author: Mauro Soria
 
 import sys
-import time
 import shutil
 
+from lib.core.data import options
 from lib.core.decorators import locked
 from lib.core.settings import IS_WINDOWS
-from lib.utils.common import human_size
-from lib.output.colors import set_color, clean_color, disable_color
+from lib.view.colors import set_color, clean_color, disable_color
 
 if IS_WINDOWS:
     from colorama.win32 import (
@@ -33,12 +32,12 @@ if IS_WINDOWS:
     )
 
 
-class Output:
-    def __init__(self, colors):
+class CLI:
+    def __init__(self):
         self.last_in_line = False
         self.buffer = ""
 
-        if not colors:
+        if not options["color"]:
             disable_color()
 
     @staticmethod
@@ -87,21 +86,20 @@ class Output:
             self.buffer += "\n"
 
     def status_report(self, response, full_url):
-        status = response.status
-        length = human_size(response.length)
         target = response.url if full_url else "/" + response.full_path
-        current_time = time.strftime("%H:%M:%S")
-        message = f"[{current_time}] {status} - {length.rjust(6, ' ')} - {target}"
+        # Get time from datetime string
+        time = response.datetime.split()[1]
+        message = f"[{time}] {response.status} - {response.size.rjust(6, ' ')} - {target}"
 
-        if status in (200, 201, 204):
+        if response.status in (200, 201, 204):
             message = set_color(message, fore="green")
-        elif status == 401:
+        elif response.status == 401:
             message = set_color(message, fore="yellow")
-        elif status == 403:
+        elif response.status == 403:
             message = set_color(message, fore="blue")
-        elif status in range(500, 600):
+        elif response.status in range(500, 600):
             message = set_color(message, fore="red")
-        elif status in range(300, 400):
+        elif response.status in range(300, 400):
             message = set_color(message, fore="cyan")
         else:
             message = set_color(message, fore="magenta")
@@ -154,49 +152,41 @@ class Output:
         message = set_color(message, fore="magenta", style="bright")
         self.new_line(message)
 
-    def print_header(self, entries):
-        msg = ""
+    def print_header(self, headers):
+        msg = []
 
-        for key, value in entries.items():
+        for key, value in headers.items():
             new = set_color(key + ": ", fore="yellow", style="bright")
             new += set_color(value, fore="cyan", style="bright")
 
-            if not msg:
-                msg += new
-                continue
-
-            new_line = msg.splitlines()[-1] + " | " + new
-
-            if len(clean_color(new_line)) >= shutil.get_terminal_size()[0]:
-                msg += "\n"
+            if (
+                not msg
+                or len(clean_color(msg[-1]) + clean_color(new)) + 3
+                >= shutil.get_terminal_size()[0]
+            ):
+                msg.append("")
             else:
-                msg += set_color(" | ", fore="magenta", style="bright")
+                msg[-1] += set_color(" | ", fore="magenta", style="bright")
 
-            msg += new
+            msg[-1] += new
 
-        self.new_line(msg)
+        self.new_line("\n".join(msg))
 
-    def config(
-        self,
-        extensions,
-        prefixes,
-        suffixes,
-        threads,
-        wordlist_size,
-        method,
-    ):
+    def config(self, wordlist_size):
 
         config = {}
-        config["Extensions"] = extensions
+        config["Extensions"] = ", ".join(options["extensions"])
 
-        if prefixes:
-            config["Prefixes"] = prefixes
-        if suffixes:
-            config["Suffixes"] = suffixes
+        if options["prefixes"]:
+            config["Prefixes"] = ", ".join(options["prefixes"])
+        if options["suffixes"]:
+            config["Suffixes"] = ", ".join(options["suffixes"])
 
-        config["HTTP method"] = method
-        config["Threads"] = threads
-        config["Wordlist size"] = wordlist_size
+        config.update({
+            "HTTP method": options["http_method"],
+            "Threads": str(options["thread_count"]),
+            "Wordlist size": str(wordlist_size),
+        })
 
         self.print_header(config)
 
@@ -204,8 +194,42 @@ class Output:
         self.new_line()
         self.print_header({"Target": target})
 
-    def output_file(self, file):
-        self.new_line(f"\nOutput File: {file}")
-
     def log_file(self, file):
         self.new_line(f"\nLog File: {file}")
+
+
+class QuietCLI(CLI):
+    def status_report(self, response, full_url):
+        super().status_report(response, True)
+
+    def last_path(*args):
+        pass
+
+    def new_directories(*args):
+        pass
+
+    def warning(*args, **kwargs):
+        pass
+
+    def header(*args):
+        pass
+
+    def config(*args):
+        pass
+
+    def target(*args):
+        pass
+
+    def log_file(*args):
+        pass
+
+
+class EmptyCLI(QuietCLI):
+    def status_report(*args):
+        pass
+
+    def error(*args):
+        pass
+
+
+interface = EmptyCLI() if options["disable_cli"] else QuietCLI() if options["quiet"] else CLI()

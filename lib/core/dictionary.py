@@ -16,20 +16,28 @@
 #
 #  Author: Mauro Soria
 
-import re
+from __future__ import annotations
 
+import re
+from typing import Any, Iterator
+
+from lib.core.data import options
 from lib.core.decorators import locked
 from lib.core.settings import (
-    SCRIPT_PATH, EXTENSION_TAG, EXCLUDE_OVERWRITE_EXTENSIONS,
-    EXTENSION_RECOGNITION_REGEX, EXTENSION_REGEX
+    SCRIPT_PATH,
+    EXTENSION_TAG,
+    EXCLUDE_OVERWRITE_EXTENSIONS,
+    EXTENSION_RECOGNITION_REGEX,
 )
+from lib.core.structures import OrderedSet
+from lib.parse.url import clean_path
 from lib.utils.common import lstrip_once
 from lib.utils.file import FileUtils
 
 
 # Get ignore paths for status codes.
 # Reference: https://github.com/maurosoria/dirsearch#Blacklist
-def get_blacklists(extensions):
+def get_blacklists() -> dict[int, Dictionary]:
     blacklists = {}
 
     for status in [400, 403, 500]:
@@ -44,34 +52,51 @@ def get_blacklists(extensions):
 
         blacklists[status] = Dictionary(
             files=[blacklist_file_name],
-            extensions=extensions
+            is_blacklist=True,
         )
 
     return blacklists
 
 
 class Dictionary:
-    def __init__(self, **kwargs):
-        self._entries = []
+    def __init__(self, **kwargs: Any) -> None:
         self._index = 0
-        self._dictionary_files = kwargs.get("files", set())
-        self.extensions = kwargs.get("extensions", ())
-        self.exclude_extensions = kwargs.get("exclude_extensions", ())
-        self.prefixes = kwargs.get("prefixes", ())
-        self.suffixes = kwargs.get("suffixes", ())
-        self.force_extensions = kwargs.get("force_extensions", False)
-        self.overwrite_extensions = kwargs.get("overwrite_extensions", False)
-        self.remove_extensions = kwargs.get("remove_extensions", False)
-        self.lowercase = kwargs.get("lowercase", False)
-        self.uppercase = kwargs.get("uppercase", False)
-        self.capitalization = kwargs.get("capitalization", False)
-        self.generate()
+        self._items = self.generate(**kwargs)
+        # Items in self._extra will be cleared when self.reset() is called
+        self._extra_index = 0
+        self._extra = []
 
     @property
-    def index(self):
+    def index(self) -> int:
         return self._index
 
-    def generate(self):
+    @locked
+    def __next__(self) -> str:
+        if len(self._extra) > self._extra_index:
+            self._extra_index += 1
+            return self._extra[self._extra_index - 1]
+        elif len(self._items) > self._index:
+            self._index += 1
+            return self._items[self._index - 1]
+        else:
+            raise StopIteration
+
+    def __contains__(self, item: str) -> bool:
+        return item in self._items
+
+    def __getstate__(self) -> tuple[list[str], int]:
+        return self._items, self._index, self._extra, self._extra_index
+
+    def __setstate__(self, state: tuple[list[str], int]) -> None:
+        self._items, self._index, self._extra, self._extra_index = state
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def generate(self, files: list[str] = [], is_blacklist: bool = False) -> list[str]:
         """
         Dictionary.generate() behaviour
 
@@ -84,115 +109,115 @@ class Dictionary:
           and DirBuster processing.
               1. If %EXT% keyword is present in the line, immediately process as "classic dirsearch" (1).
               2. If the line does not include the special word AND is NOT terminated by a slash,
-                append one with each extension APPENDED (line.ext) and ONLYE ONE with a slash.
+                append one with each extension APPENDED (line.ext) and ONLY ONE with a slash.
               3. If the line does not include the special word and IS ALREADY terminated by slash,
                 append line unmodified.
         """
 
+        wordlist = OrderedSet()
         re_ext_tag = re.compile(EXTENSION_TAG, re.IGNORECASE)
-        re_extension = re.compile(EXTENSION_REGEX, re.IGNORECASE)
 
-        for dict_file in self._dictionary_files:
+        for dict_file in files:
             for line in FileUtils.get_lines(dict_file):
                 # Removing leading "/" to work with prefixes later
                 line = lstrip_once(line, "/")
 
-                if self.remove_extensions:
+                if options["remove_extensions"]:
                     line = line.split(".")[0]
 
-                # Skip comments and empty lines
-                if not line or line.lstrip().startswith("#"):
-                    continue
-
-                # Skip if the path contains excluded extensions
-                if any(
-                    "." + extension in line for extension in self.exclude_extensions
-                ):
+                if not self.is_valid(line):
                     continue
 
                 # Classic dirsearch wordlist processing (with %EXT% keyword)
                 if EXTENSION_TAG in line.lower():
-                    for extension in self.extensions:
+                    for extension in options["extensions"]:
                         newline = re_ext_tag.sub(extension, line)
-                        self.add(newline)
-                # If "forced extensions" is used and the path is not a directory (terminated by /)
-                # or has had an extension already, append extensions to the path
-                elif (
-                    self.force_extensions
-                    and not line.endswith("/")
-                    and not re.search(EXTENSION_RECOGNITION_REGEX, line)
-                ):
-                    self.add(line)
-                    self.add(line + "/")
-
-                    for extension in self.extensions:
-                        self.add(f"{line}.{extension}")
-                # Overwrite unknown extensions with selected ones (but also keep the origin)
-                elif (
-                    self.overwrite_extensions
-                    and not line.endswith(self.extensions + EXCLUDE_OVERWRITE_EXTENSIONS)
-                    # Paths that have queries in wordlist are usually used for exploiting
-                    # diclosed vulnerabilities of services, skip such paths
-                    and "?" not in line
-                    and "#" not in line
-                    and re.search(EXTENSION_RECOGNITION_REGEX, line)
-                ):
-                    self.add(line)
-
-                    for extension in self.extensions:
-                        newline = re_extension.sub(f".{extension}", line)
-                        self.add(newline)
-                # Append line unmodified.
+                        wordlist.add(newline)
                 else:
-                    self.add(line)
+                    wordlist.add(line)
 
-    def add(self, path):
-        def append(path):
-            if self.lowercase:
-                path = path.lower()
-            elif self.uppercase:
-                path = path.upper()
-            elif self.capitalization:
-                path = path.capitalize()
+                    # "Forcing extensions" and "overwriting extensions" shouldn't apply to
+                    # blacklists otherwise it might cause false negatives
+                    if is_blacklist:
+                        continue
 
-            if path not in self._entries:
-                self._entries.append(path)
+                    # If "forced extensions" is used and the path is not a directory (terminated by /)
+                    # or has had an extension already, append extensions to the path
+                    if (
+                        options["force_extensions"]
+                        and "." not in line
+                        and not line.endswith("/")
+                    ):
+                        wordlist.add(line + "/")
 
-        for pref in self.prefixes:
-            if not path.startswith(("/", pref)):
-                append(pref + path)
-        for suff in self.suffixes:
-            if not path.endswith(("/", suff)) and "#" not in path:
-                append(path + suff)
+                        for extension in options["extensions"]:
+                            wordlist.add(f"{line}.{extension}")
+                    # Overwrite unknown extensions with selected ones (but also keep the origin)
+                    elif (
+                        options["overwrite_extensions"]
+                        and not line.endswith(options["extensions"] + EXCLUDE_OVERWRITE_EXTENSIONS)
+                        # Paths that have queries in wordlist are usually used for exploiting
+                        # disclosed vulnerabilities of services, skip such paths
+                        and "?" not in line
+                        and "#" not in line
+                        and re.search(EXTENSION_RECOGNITION_REGEX, line)
+                    ):
+                        base = line.split(".")[0]
 
-        if not self.prefixes and not self.suffixes:
-            append(path)
+                        for extension in options["extensions"]:
+                            wordlist.add(f"{base}.{extension}")
 
-    def reset(self):
-        self._index = 0
+        if not is_blacklist:
+            # Appending prefixes and suffixes
+            altered_wordlist = OrderedSet()
 
-    def __contains__(self, item):
-        return item in self._entries
+            for path in wordlist:
+                for pref in options["prefixes"]:
+                    if (
+                        not path.startswith(("/", pref))
+                    ):
+                        altered_wordlist.add(pref + path)
+                for suff in options["suffixes"]:
+                    if (
+                        not path.endswith(("/", suff))
+                        # Appending suffixes to the URL fragment is useless
+                        and "?" not in path
+                        and "#" not in path
+                    ):
+                        altered_wordlist.add(path + suff)
 
-    def __getstate__(self):
-        return (self._entries, self._index, self.extensions)
+            if altered_wordlist:
+                wordlist = altered_wordlist
 
-    def __setstate__(self, state):
-        self._entries, self._index, self.extensions = state
+        if options["lowercase"]:
+            return list(map(str.lower, wordlist))
+        elif options["uppercase"]:
+            return list(map(str.upper, wordlist))
+        elif options["capitalization"]:
+            return list(map(str.capitalize, wordlist))
+        else:
+            return list(wordlist)
 
-    @locked
-    def __next__(self):
-        try:
-            path = self._entries[self._index]
-        except IndexError:
-            raise StopIteration
+    def is_valid(self, path: str) -> bool:
+        # Skip comments and empty lines
+        if not path or path.startswith("#"):
+            return False
 
-        self._index += 1
+        # Skip if the path has excluded extensions
+        cleaned_path = clean_path(path)
+        if cleaned_path.endswith(
+            tuple(f".{extension}" for extension in options["exclude_extensions"])
+        ):
+            return False
 
-        return path
+        return True
 
-    def __iter__(self):
-        return iter(self._entries)
+    def add_extra(self, path) -> None:
+        if path in self._items or path in self._extra:
+            return
 
-    def __len__(self):
-        return len(self._entries)
+        self._extra.append(path)
+
+    def reset(self) -> None:
+        self._index = self._extra_index = 0
+        self._extra.clear()
